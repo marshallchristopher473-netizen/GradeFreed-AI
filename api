@@ -65,3 +65,166 @@ export default async function handler(req, res) {
 // Explicit max duration — safely inside Vercel Hobby's configurable
 // 1–60s range, well above our own 25s internal timeout.
 export const config = { maxDuration: 30 };
+// ─────────────────────────────────────────────────────────────
+// api/grade.js  —  Vercel Serverless Function (NEW — Phase 2.1)
+//
+// WHY A SEPARATE ROUTE FROM /api/claude:
+//   The old approach built a giant text prompt in the BROWSER
+//   and asked the AI to reply in a specific text layout. That's
+//   fragile — if the AI's wording drifts even slightly, the UI
+//   can't reliably display it.
+//
+//   This route owns the ENTIRE contract on the SERVER:
+//     - the exact prompt sent to Claude
+//     - the exact JSON shape Claude must return
+//     - validation that the response actually matches that shape
+//
+//   The browser sends plain fields (student work, rubric info)
+//   and gets back a real JavaScript object, not a text blob to
+//   parse. This is what "production-ready" means for an AI
+//   feature — the AI's output is treated as untrusted input and
+//   verified before your UI ever touches it.
+//
+// REQUEST BODY (from the browser):
+//   { subject, gradeLevel, standard, standardCode,
+//     assignmentPrompt, studentWork, maxScore }
+//
+// RESPONSE BODY (to the browser):
+//   {
+//     score, maxScore, percentage, letterGrade,
+//     rubricBreakdown: [{ criterion, pointsEarned, pointsPossible, justification }],
+//     strengths: [string], weaknesses: [string],
+//     feedback: string, suggestedRevisions: [string],
+//     flagForReview: boolean, flagReason: string
+//   }
+// ─────────────────────────────────────────────────────────────
+
+import { callAnthropic, parseStructuredJSON } from './_shared/anthropic.js';
+import { checkRateLimit, getClientIp } from './_shared/rateLimit.js';
+
+const MAX_STUDENT_WORK_CHARS = 15000; // ~2,500 words — generous for any K-12/college assignment
+const MAX_PROMPT_CHARS       = 3000;
+
+const REQUIRED_KEYS = [
+  'score', 'maxScore', 'rubricBreakdown', 'strengths',
+  'weaknesses', 'feedback', 'suggestedRevisions', 'flagForReview',
+];
+
+const LETTER_FALLBACK = (pct) => {
+  if (pct >= 90) return 'A';
+  if (pct >= 80) return 'B';
+  if (pct >= 70) return 'C';
+  if (pct >= 60) return 'D';
+  return 'F';
+};
+
+export default async function handler(req, res) {
+  const ip = getClientIp(req);
+
+  if (req.method !== 'POST') {
+    return res.status(405).json({ error: 'Method Not Allowed — use POST' });
+  }
+
+  const limit = checkRateLimit(ip);
+  if (!limit.allowed) {
+    console.warn(JSON.stringify({ event: 'rate_limited', route: 'grade', ip, retryAfterSeconds: limit.retryAfterSeconds }));
+    res.setHeader('Retry-After', String(limit.retryAfterSeconds));
+    return res.status(429).json({ error: `Too many requests. Try again in ${limit.retryAfterSeconds}s.` });
+  }
+
+  const {
+    subject = 'General',
+    gradeLevel = 'Unspecified',
+    standard = 'General standard',
+    standardCode = '',
+    assignmentPrompt = 'General assignment',
+    studentWork,
+    maxScore = 4,
+  } = req.body ?? {};
+
+  // ── Input validation — never trust the browser ──────────────
+  if (!studentWork || typeof studentWork !== 'string' || studentWork.trim() === '') {
+    return res.status(400).json({ error: 'studentWork is required and cannot be empty.' });
+  }
+  if (studentWork.length > MAX_STUDENT_WORK_CHARS) {
+    return res.status(400).json({ error: `Student work too long (${studentWork.length} chars, max ${MAX_STUDENT_WORK_CHARS}). Split it into smaller submissions.` });
+  }
+  if (String(assignmentPrompt).length > MAX_PROMPT_CHARS) {
+    return res.status(400).json({ error: `Assignment prompt too long (max ${MAX_PROMPT_CHARS} chars).` });
+  }
+  const numericMaxScore = Number(maxScore) || 4;
+  if (numericMaxScore < 1 || numericMaxScore > 100) {
+    return res.status(400).json({ error: 'maxScore must be between 1 and 100.' });
+  }
+
+  if (!process.env.ANTHROPIC_API_KEY) {
+    console.error(JSON.stringify({ event: 'missing_api_key', route: 'grade' }));
+    return res.status(500).json({ error: 'ANTHROPIC_API_KEY is not set. Add it in your Vercel project settings.' });
+  }
+
+  const prompt = `You are an expert ${subject} teacher for Grade ${gradeLevel}, grading against ${standard}${standardCode ? ` (${standardCode})` : ''}.
+
+ASSIGNMENT PROMPT:
+${assignmentPrompt}
+
+STUDENT WORK TO GRADE:
+${studentWork}
+
+Score this out of ${numericMaxScore} points using specific, observable evidence from the text — not vague impressions.
+
+Respond with ONLY valid JSON. No markdown formatting, no code fences, no text before or after the JSON object. Match this EXACT shape:
+
+{
+  "score": <number, 0 to ${numericMaxScore}>,
+  "maxScore": ${numericMaxScore},
+  "letterGrade": "<your suggested letter grade — A/B/C/D/F — teacher may override per their school's policy>",
+  "rubricBreakdown": [
+    { "criterion": "<specific rubric criterion>", "pointsEarned": <number>, "pointsPossible": <number>, "justification": "<one sentence, evidence-based>" }
+  ],
+  "strengths": ["<specific observable strength>", "<another specific strength>"],
+  "weaknesses": ["<specific actionable growth area>", "<another growth area>"],
+  "feedback": "<2-3 warm, honest sentences written directly TO the student, grade-appropriate language>",
+  "suggestedRevisions": ["<one specific, actionable revision suggestion>", "<another if applicable>"],
+  "flagForReview": <true if this submission is ambiguous, borderline, possibly off-topic, or shows signs of academic dishonesty — otherwise false>,
+  "flagReason": "<why flagged, or \\"Straightforward grade — no manual review needed\\" if not flagged>"
+}`;
+
+  const start = Date.now();
+  try {
+    const rawText = await callAnthropic({
+      apiKey: process.env.ANTHROPIC_API_KEY,
+      maxTokens: 1500,
+      messages: [{ role: 'user', content: prompt }],
+    });
+
+    const parsed = parseStructuredJSON(rawText, REQUIRED_KEYS);
+
+    // Percentage is computed here in code, not by the AI — this removes
+    // an entire class of potential arithmetic mistakes from the model.
+    const score = Number(parsed.score) || 0;
+    const percentage = Math.round((score / numericMaxScore) * 100);
+
+    const result = {
+      score,
+      maxScore: numericMaxScore,
+      percentage,
+      letterGrade: parsed.letterGrade || LETTER_FALLBACK(percentage),
+      rubricBreakdown: Array.isArray(parsed.rubricBreakdown) ? parsed.rubricBreakdown : [],
+      strengths: Array.isArray(parsed.strengths) ? parsed.strengths : [],
+      weaknesses: Array.isArray(parsed.weaknesses) ? parsed.weaknesses : [],
+      feedback: parsed.feedback || '',
+      suggestedRevisions: Array.isArray(parsed.suggestedRevisions) ? parsed.suggestedRevisions : [],
+      flagForReview: Boolean(parsed.flagForReview),
+      flagReason: parsed.flagReason || '',
+    };
+
+    console.log(JSON.stringify({ event: 'grade_success', ip, subject, gradeLevel, score, maxScore: numericMaxScore, flagged: result.flagForReview, ms: Date.now() - start }));
+    return res.status(200).json(result);
+
+  } catch (error) {
+    console.error(JSON.stringify({ event: 'grade_error', ip, message: error.message, ms: Date.now() - start }));
+    return res.status(error.status || 500).json({ error: error.message || 'Unexpected server error while grading.' });
+  }
+}
+
+export const config = { maxDuration: 30 };
