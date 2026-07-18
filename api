@@ -1,1 +1,68 @@
+// ─────────────────────────────────────────────────────────────
+// api/claude.js  —  Vercel Serverless Function (HARDENED — Sprint 1)
+//
+// Generic proxy still used by Rubric Builder, Scheduler, and
+// Feynman Module. The AI Grader has moved to its own dedicated
+// route (/api/grade.js) with a strict JSON contract — see that
+// file for why. This route will get the same dedicated-route
+// treatment for the other 3 features next (see roadmap doc).
+//
+// WHAT CHANGED FROM THE FIRST VERSION:
+//   + rate limiting (10 req/min per IP — see _shared/rateLimit.js)
+//   + input length cap (prevents runaway token costs)
+//   + 25s timeout instead of hanging forever
+//   + structured console logging (visible in Vercel's function logs)
+// ─────────────────────────────────────────────────────────────
 
+import { callAnthropic } from './_shared/anthropic.js';
+import { checkRateLimit, getClientIp } from './_shared/rateLimit.js';
+
+const MAX_PROMPT_CHARS = 20000; // generous — covers long rubric/schedule prompts
+
+export default async function handler(req, res) {
+  const ip = getClientIp(req);
+
+  if (req.method !== 'POST') {
+    return res.status(405).json({ error: 'Method Not Allowed — use POST' });
+  }
+
+  const limit = checkRateLimit(ip);
+  if (!limit.allowed) {
+    console.warn(JSON.stringify({ event: 'rate_limited', route: 'claude', ip, retryAfterSeconds: limit.retryAfterSeconds }));
+    res.setHeader('Retry-After', String(limit.retryAfterSeconds));
+    return res.status(429).json({ error: `Too many requests. Try again in ${limit.retryAfterSeconds}s.` });
+  }
+
+  const { prompt } = req.body ?? {};
+
+  if (!prompt || typeof prompt !== 'string' || prompt.trim() === '') {
+    return res.status(400).json({ error: 'Missing or invalid prompt in request body' });
+  }
+  if (prompt.length > MAX_PROMPT_CHARS) {
+    return res.status(400).json({ error: `Prompt too long (${prompt.length} chars, max ${MAX_PROMPT_CHARS}).` });
+  }
+
+  if (!process.env.ANTHROPIC_API_KEY) {
+    console.error(JSON.stringify({ event: 'missing_api_key', route: 'claude' }));
+    return res.status(500).json({ error: 'ANTHROPIC_API_KEY is not set. Add it in your Vercel project settings.' });
+  }
+
+  const start = Date.now();
+  try {
+    const text = await callAnthropic({
+      apiKey: process.env.ANTHROPIC_API_KEY,
+      messages: [{ role: 'user', content: prompt }],
+    });
+
+    console.log(JSON.stringify({ event: 'claude_success', route:'claude', ip, promptChars: prompt.length, ms: Date.now() - start }));
+    return res.status(200).json({ text: text || 'No response received.' });
+
+  } catch (error) {
+    console.error(JSON.stringify({ event: 'claude_error', route:'claude', ip, message: error.message, ms: Date.now() - start }));
+    return res.status(error.status || 500).json({ error: error.message || 'Unexpected server error.' });
+  }
+}
+
+// Explicit max duration — safely inside Vercel Hobby's configurable
+// 1–60s range, well above our own 25s internal timeout.
+export const config = { maxDuration: 30 };
