@@ -1,4 +1,131 @@
-ROADMAP.md
-MVP-AUDIT.md
-ARCHITECTURE.md
-archive/
+# GradeFreed AI — MVP Engineering Audit & Roadmap
+## Sprint 1 Report — Lead Engineer Handoff
+
+Generated against the actual codebase (not a description of it) on the date of this sprint.
+Every finding below was verified by reading or running the real code — nothing here is assumed.
+
+---
+
+## PHASE 1 — CODEBASE AUDIT (as of Sprint 1 start)
+
+### Frontend
+| Item | Finding |
+|---|---|
+| Framework | React 18 + Vite, single component (`App.jsx`, ~1,200 lines) |
+| Architecture | Render-function pattern (not nested components) — correct, avoids remount bugs |
+| Styling | Inline style objects + shared design tokens (`C` constants) — no CSS framework |
+| Routing | None — navigation is `useState('tab')`. Fine for MVP, blocks shareable/deep-linked URLs later |
+| Component library | None — all UI atoms (Card, Btn, Sel, Tag, Pill) are hand-built and consistent |
+
+### API Routes (before this sprint)
+| Route | Status |
+|---|---|
+| `/api/claude.js` | Existed. Generic pass-through. **No rate limit, no input cap, no timeout.** |
+| All 4 AI features | Routed through the same generic endpoint with client-built prompts |
+
+### Database
+**None.** Zero persistence layer existed. All state — brain profile, papers graded, rubrics built — lived only in React memory and was lost on every page refresh. **This was the single largest gap for real beta users.**
+
+### Authentication
+**None.** No login, no accounts, no sessions. Anyone with the URL has full access, and each browser tab is its own disconnected "session."
+
+### Environment Variables
+| Variable | Required by | Status |
+|---|---|---|
+| `ANTHROPIC_API_KEY` | `/api/claude.js`, `/api/grade.js` | Must be set in Vercel project settings |
+
+### Critical Security Finding
+The frontend `App.jsx` still contained a **direct call to `api.anthropic.com` from the browser** — the exact vulnerability the deployment scaffold (built in a prior sprint) was supposed to eliminate. A patch file existed with the fix, but it had never actually been applied to the real file. **This has been corrected in this sprint** (see Phase 2 below).
+
+### Deployment Risks (before this sprint)
+- No rate limiting → one user or bot could exhaust the free Anthropic quota in minutes
+- No request timeout → a hung Anthropic call would spin the UI loader forever
+- No input length cap → an oversized paste could fail unpredictably or cost more than expected
+- No structured logging → a production failure would be nearly impossible to diagnose from Vercel's raw logs
+- No error boundary → an unexpected render error would white-screen the entire app
+
+---
+
+## PRIORITIZED MVP CHECKLIST
+
+### 🔴 P0 — Blocking (must fix before ANY beta user touches it)
+- [x] **Remove direct-to-Anthropic call from the browser** — *fixed this sprint*
+- [x] **Add request timeout** (client: 20-25s, server: 25s + AbortController) — *fixed this sprint*
+- [x] **Add rate limiting** (10 req/min/IP, honest about serverless limitations) — *fixed this sprint*
+- [x] **Add input length validation** (student work capped at 15,000 chars) — *fixed this sprint*
+- [x] **Add localStorage persistence** (profile, graded count, rubric count survive refresh) — *fixed this sprint*
+
+### 🟠 P1 — Core value delivery (the app doesn't deliver its promise without these)
+- [x] **AI Grader → structured JSON contract** (score, rubric breakdown, strengths, weaknesses, feedback, suggested revisions, review flag) — *Sprint 1, dedicated `/api/grade.js` route*
+- [x] **Rubric Builder → structured JSON contract** (categories, proficiency levels per category, accommodations, common mistakes, exemplar) — *Sprint 2, dedicated `/api/rubric.js` route*
+- [ ] **React Error Boundary** wrapping the whole app so one bad render doesn't white-screen everything — *next sprint*
+- [ ] **Structured logging on all 4 AI routes** (4 of 4 done — claude.js, grade.js, rubric.js, schedule.js; feynman still on the generic route)
+
+### 🟡 P2 — Needed for a credible beta (not day-one blocking)
+- [x] **Scheduler real data model + dedicated route** — assignments and interventions are now real objects with due dates, not text fields. `/api/schedule.js` returns real day/block objects with deterministic hours-freed math. Lightweight progress tracking (session-over-session delta) added. — *Sprint 3*
+- [ ] **Feynman mastery score parsing** — currently free text; needs the same structured-JSON treatment as Grader/Rubric/Scheduler
+- [ ] **Mobile responsive layout** — fixed 2/3/5-column CSS grids will overflow under ~600px width. Scheduler's new 5-column assignment row makes this more urgent, not less.
+- [ ] **Real auth + database decision** — localStorage is a bridge, not a destination. **Now higher priority than before:** the Scheduler's Intervention Reminders feature invites teachers to enter student information into browser-only storage with no encryption and no accounts. A privacy warning is now shown directly in the UI, but this is a real compliance question (FERPA-relevant for U.S. K-12 data) that deserves your explicit decision before this feature goes in front of real students' data. Recommendation unchanged: Supabase free tier.
+
+### 🟢 P3 — Needed before investor/admin demos (not before teacher beta)
+- [ ] 8-screen polish pass (Dashboard, Diagnostic, Grader, Rubric, Scheduler, Certification, Analytics, Settings)
+- [ ] Demo account + seeded sample data (students, assignments, rubrics)
+- [ ] Landing page copy
+- [ ] Pricing page structure
+- [ ] Public product roadmap page
+
+---
+
+## WHY THIS ORDER (not the literal Phase 1→5 sequence as originally listed)
+
+Building all 5 phases simultaneously — 8 screens, a database schema, a landing page, and 4 AI features — in one pass would mean every piece is shallow and untested. Real engineering teams ship narrow, verified slices. This sprint fully hardened the infrastructure (P0) and fully upgraded one AI feature end-to-end (P1's first item) with real, passing tests — rather than a thin, unverified pass across all four features and eight screens at once.
+
+---
+
+## SPRINT 1 — WHAT SHIPPED
+
+| File | Change |
+|---|---|
+| `src/App.jsx` | Security fix (no more direct Anthropic call) · localStorage persistence · new structured Grade Report UI |
+| `api/claude.js` | Hardened: rate limit, input cap, timeout, structured logs |
+| `api/grade.js` | **New.** Dedicated structured-JSON grading endpoint |
+| `api/_shared/anthropic.js` | **New.** Shared Anthropic caller + JSON-parsing safety net |
+| `api/_shared/rateLimit.js` | **New.** Shared rate limiter (with honest documentation of its limits) |
+
+**Test results:** 8/8 automated tests passing against the real `api/grade.js` handler. `App.jsx` and all backend files verified to compile with zero syntax errors.
+
+---
+
+## SPRINT 2 — WHAT SHIPPED
+
+| File | Change |
+|---|---|
+| `src/App.jsx` | Added objective-input field · new `buildRubric` helper · `handleRubric` rewired to `/api/rubric` · new structured `RubricReportCard` UI |
+| `api/rubric.js` | **New.** Dedicated structured-JSON rubric endpoint — categories, proficiency levels, accommodations, common mistakes, exemplar |
+
+**Test results:** 8/8 new automated tests passing against `api/rubric.js` (method guard, missing/oversized objective, invalid point scale on both ends, missing key, successful structured parse, empty-categories rejection).
+
+**A real bug was caught and fixed before shipping:** a duplicate closing brace (`};`) left over from a `str_replace` edit broke the entire file's syntax. Caught by running two independent parsers (esbuild + Babel) rather than assuming the edit was correct — Babel's precise error location (`'return' outside of function`, exact line number) found it in under a minute. Both Sprint 1 and Sprint 2 test suites were re-run afterward to confirm zero regressions (16/16 passing combined).
+
+---
+
+## SPRINT 3 — WHAT SHIPPED
+
+| File | Change |
+|---|---|
+| `src/App.jsx` | Assignment/intervention data model with real due dates · privacy warning in the UI · `buildSchedule` helper · lightweight snapshot-based progress tracking · new structured `ScheduleReportCard` UI |
+| `api/schedule.js` | **New.** Dedicated structured-JSON scheduling endpoint — real day/block objects, deterministic hours-freed math, upcoming-deadlines list |
+
+**Test results:** 10/10 new automated tests passing against `api/schedule.js`, including a test that specifically verifies `hoursWithoutAI` is computed from the real submitted assignment data rather than trusted from the AI's output — and a fallback test confirming the schedule still works sensibly if the AI omits `hoursWithAI` entirely.
+
+**A real bug was caught and fixed before shipping:** the persistence `useEffect` that saves `{ profile, graded, rCount }` on every change would have silently overwritten the new snapshot history every time, since both write to the same localStorage key. Caught during code review before it ever ran — fixed by merging with existing saved data instead of blindly overwriting it. All three cumulative test suites (grade, rubric, schedule — 26 tests total) re-verified after every edit.
+
+**A real compliance flag, not just a code fix:** Intervention Reminders let a teacher type in student information with zero backend, zero encryption, zero accounts. A visible privacy warning was added directly above that section, and the P2 checklist above was reordered — the auth/database decision is now flagged as higher-priority than before, specifically because of this feature.
+
+---
+
+## NEXT ENGINEERING PRIORITY
+
+**Feynman Module gets the same "text blob → structured JSON" treatment Grader and Rubric got** — a dedicated `/api/feynman.js` route returning a real mastery score, specific gap analysis, and a parseable "ready to grade / needs refinement" verdict, instead of free text. Feynman doesn't need a new data model first (unlike Scheduler) — it's a direct port of the same pattern, so it should be the fastest of the four AI features to convert.
+
+After Feynman: all four AI features will be on dedicated, tested, structured routes. At that point the next real priority is the **React Error Boundary** (quick, cheap, prevents one bad render from white-screening the whole app) and then the **Supabase/auth decision**, which is no longer optional-feeling now that student data has entered the picture via Intervention Reminders.
